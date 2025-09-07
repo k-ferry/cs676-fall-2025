@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+.env
+
+# Jupyter / Colab
+.ipynb_checkpoints/
+*.nbconvert.ipynb
+*.ipynb_convert
+sample_data/
+.config/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
