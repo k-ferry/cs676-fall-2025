@@ -1,1 +1,7 @@
--r project-1/requirements.txt
+gradio
+requests
+beautifulsoup4
+lxml
+scikit-learn
+pandas
+numpy
