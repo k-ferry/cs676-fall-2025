@@ -1,82 +1,130 @@
-# app_gradio.py — Gradio UI for Deliverable 3
-# Purpose:
-# - Collect a player name
-# - Use Perplexity to retrieve URLs
-# - Score with your credibility scorer
-# - Display a ranked table with scores, percentiles, hosts, URLs, and top rationales
+# project-1/app_gradio.py
+# Minimal, reliable Gradio app that:
+#  - lets you enter a player name
+#  - (optionally) calls Perplexity to fetch URLs
+#  - scores URLs with scorer.rank_listings
+#  - ALWAYS calls demo.launch() so Spaces boots correctly
 
+from __future__ import annotations
 import os
+import traceback
 import pandas as pd
 import gradio as gr
 
+# Local imports (your repo structure)
+from src.scorer import rank_listings, score_url
 from src.pplx_client import pplx_search_sources
-from src.scorer import rank_listings
 
-def search_and_score(player: str, max_urls: int, dry_run: bool):
-    # Health checks + helpful messages
-    if not player or not player.strip():
-        return pd.DataFrame(), "Please enter a player name."
+APP_TITLE = "Soccer Card Credibility (Deliverable 3)"
+APP_DESC = "Enter a player, optionally search with Perplexity, and score the returned listing URLs."
 
-    if not os.getenv("PERPLEXITY_API_KEY"):
-        return pd.DataFrame(), (
-            "Missing PERPLEXITY_API_KEY. In your Space, go to "
-            "Settings → Variables and secrets → add a Secret named PERPLEXITY_API_KEY."
-        )
+def _to_df(rows: list[dict]) -> pd.DataFrame:
+    if not rows:
+        return pd.DataFrame()
+    # Flatten signals a bit for display
+    def top3(siglist):
+        siglist = sorted(siglist, key=lambda s: s["value"] * s["weight"], reverse=True)
+        return ", ".join(f"{s['name']}" for s in siglist[:3])
+    out = []
+    for r in rows:
+        out.append({
+            "score_abs": r["score"]["absolute"],
+            "score_pct": r["score"]["percentile"],
+            "status": r["status"],
+            "url": r["url"],
+            "host": r["meta"].get("host"),
+            "top_signals": top3(r["signals"]),
+            "errors": "; ".join(r.get("errors") or []),
+        })
+    df = pd.DataFrame(out).sort_values("score_abs", ascending=False)
+    return df
 
+def score_player(
+    player: str,
+    max_urls: int,
+    use_perplexity: bool,
+    dry_run: bool,
+    manual_urls_text: str,
+) -> tuple[str, pd.DataFrame]:
+    """
+    Returns (log_text, dataframe)
+    """
+    logs = []
     try:
-        discovery = pplx_search_sources(player.strip(), max_urls=max_urls)
-        urls = discovery.get("urls", [])
+        urls = []
+        if use_perplexity:
+            key = os.getenv("PERPLEXITY_API_KEY")
+            if not key:
+                return ("PERPLEXITY_API_KEY is not set in Space Secrets. "
+                        "Go to Settings → Variables & secrets and add it.",
+                        pd.DataFrame())
+            res = pplx_search_sources(player, max_urls=max_urls, api_key=key)
+            urls = res.get("urls", [])
+            logs.append(f"Perplexity returned {len(urls)} URL(s).")
+        else:
+            # Manual URLs: one per line or space-separated
+            if manual_urls_text.strip():
+                urls = [u.strip() for u in manual_urls_text.replace("\r","").splitlines() if u.strip()]
+                if not urls:
+                    # fallback: split by spaces
+                    urls = [u for u in manual_urls_text.split() if u.startswith("http")]
+                logs.append(f"Using {len(urls)} manual URL(s).")
+            else:
+                # No Perplexity and no manual URLs → demo URLs
+                urls = [
+                    "https://www.ebay.com/itm/123",
+                    "https://www.comc.com/Cards/Soccer",
+                    "http://example.com/article",
+                ]
+                logs.append("No URLs provided. Using demo URLs.")
+
         if not urls:
-            return pd.DataFrame(), f"No URLs found for '{player}'. Try a different spelling."
+            return ("No URLs to score.", pd.DataFrame())
 
         rows = rank_listings(urls, dry_run=dry_run)
+        df = _to_df(rows)
+        if dry_run:
+            logs.append("dry_run=True (synthetic pages) — no network fetch.")
+        else:
+            logs.append("dry_run=False — fetched live pages (may be slower).")
 
-        # Build compact table with top rationales
-        table = []
-        for r in rows:
-            top3 = sorted(r["signals"], key=lambda s: s["value"] * s["weight"], reverse=True)[:3]
-            rationale = "; ".join([f"{s['name']}: {s['rationale']}" for s in top3])
-            table.append({
-                "Score": r["score"]["absolute"],
-                "Pct": r["score"]["percentile"],
-                "Host": r["meta"]["host"],
-                "Status": r["status"],
-                "URL": r["url"],
-                "Top rationales": rationale,
-            })
-
-        df = pd.DataFrame(table).sort_values("Score", ascending=False, ignore_index=True)
-        note = f"Found {len(urls)} URLs for {player}."
-        return df, note
-
+        return ("\n".join(logs), df)
     except Exception as e:
-        return pd.DataFrame(), f"Error: {e}"
+        err = f"Exception: {e}\n{traceback.format_exc()}"
+        return (err, pd.DataFrame())
 
-with gr.Blocks(theme=gr.themes.Default()) as demo:
-    gr.Markdown("# Soccer Card Source Credibility (RAG + Scorer)")
-    gr.Markdown("Enter a player; we’ll fetch sources via Perplexity, then score each URL’s credibility.")
-
-    with gr.Row():
-        player = gr.Textbox(label="Player name", value="Bukayo Saka", scale=3)
-        max_urls = gr.Slider(label="Max URLs", minimum=5, maximum=25, value=12, step=1, scale=2)
-        dry_run = gr.Checkbox(label="Dry run (synthetic scoring pages)", value=False, scale=1)
-
-    run = gr.Button("Search & Score", variant="primary")
+with gr.Blocks(title=APP_TITLE) as demo:
+    gr.Markdown(f"# {APP_TITLE}\n{APP_DESC}")
 
     with gr.Row():
-        out_df = gr.Dataframe(
-            headers=["Score", "Pct", "Host", "Status", "URL", "Top rationales"],
-            datatype=["number", "number", "str", "str", "str", "str"],
-            interactive=False,
-            wrap=True,
-            label="Ranked sources"
-        )
-    note = gr.Markdown()
+        player = gr.Textbox(label="Player", value="Bukayo Saka", placeholder="Enter a player name")
+        max_urls = gr.Slider(1, 20, value=10, step=1, label="Max URLs")
 
-    with gr.Accordion("Health", open=False):
-        has_key = bool(os.getenv("PERPLEXITY_API_KEY"))
-        gr.Markdown(f"**PERPLEXITY_API_KEY set:** `{has_key}`  \nSet it in: Settings → Variables and secrets → Secrets")
+    with gr.Row():
+        use_perplexity = gr.Checkbox(value=True, label="Use Perplexity to search for URLs")
+        dry_run = gr.Checkbox(value=False, label="Dry run (use synthetic pages)")
 
-    run.click(fn=search_and_score, inputs=[player, max_urls, dry_run], outputs=[out_df, note])
+    manual_urls = gr.Textbox(
+        label="Manual URLs (one per line, used only if Perplexity is OFF)",
+        placeholder="https://www.ebay.com/itm/...\nhttps://www.pwccmarketplace.com/..."
+    )
 
-# IMPORTANT for Spaces: do not call demo.launch(); Spaces will run it automatically.
+    run_btn = gr.Button("Search & Score", variant="primary")
+
+    logs = gr.Textbox(label="Logs", lines=6)
+    table = gr.Dataframe(
+        headers=["score_abs","score_pct","status","url","host","top_signals","errors"],
+        interactive=False,
+        wrap=True
+    )
+
+    run_btn.click(
+        fn=score_player,
+        inputs=[player, max_urls, use_perplexity, dry_run, manual_urls],
+        outputs=[logs, table],
+        show_progress=True
+    )
+
+# IMPORTANT: Start the app explicitly so Spaces sees an initialized app.
+if __name__ == "__main__":
+    demo.launch()
